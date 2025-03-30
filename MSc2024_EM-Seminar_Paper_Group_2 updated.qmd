@@ -591,8 +591,7 @@ Include FF3 or FF-C4 betas as controls: $$R_{i,t+1} = \gamma_{0,t} + \gamma_1 \c
 
 ```{r extended regressions, message = FALSE, warning = FALSE, echo = FALSE}
 
-
-
+TEST
 
 ```
 
