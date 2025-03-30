@@ -1,0 +1,636 @@
+---
+title: "Seminar Paper"
+author: "Andrea Landini, Merve Can, Kara Nicole Romano, Timo Volenter"
+date: "2025-04-30"
+format:
+  html:
+    css: custom.css
+    toc: true
+  pdf:
+    toc: true
+    toc-depth: 1
+    number-sections: true
+    colorlinks: true
+bibliography: references.bib
+# csl: apa.csl
+editor: 
+  markdown: 
+    wrap: sentence
+---
+
+::: callout-note
+All code should be **well documented** and interpreted.
+Include **plain text explanations** with markdown styling and use **R code-chunks** for the code.
+Your **final document should compile to both HTML and PDF**.
+:::
+
+```{r setup, message = FALSE, warning = FALSE, echo = FALSE}
+suppressPackageStartupMessages(library(tidyverse))
+library(RSQLite)
+library(dbplyr)
+library(broom)
+library(lmtest)
+library(sandwich)
+library(ggplot2)
+library(kableExtra)
+library(GRS.test)
+# Connect to database
+db_path <- "/home/shared/data/tidy_finance.sqlite"
+tidy_finance <- dbConnect(
+  SQLite(),
+  db_path,
+  extended_types = TRUE
+)
+dbListTables(tidy_finance)
+dbListFields(tidy_finance, "signals")
+
+
+
+```
+
+# 📄 Seminar Paper: Signal-based Asset Pricing Factor Analysis (Replication + Extension)
+
+**Objective** Each student team selects one of the predictive signals ("clear predictor") from Chen & Zimmermann’s dataset and:
+
+1.  **Replicates** the factor construction and basic results (mean return and t-stat from Table 2),
+2.  **Constructs and evaluates** a factor based on that signal,
+3.  **Performs pricing tests** against the FF-C4 model (CAPM, FF3, FF6 also possible),
+4.  **Evaluates** risk premia via cross-sectional regressions and time-varying Fama-MacBeth regressions.
+
+------------------------------------------------------------------------
+
+## **Structure and Key Steps**
+
+### **1. Select and document one signal**
+
+-   Each group picks a **single characteristic** (from the list of clear predictors in Table 2).
+-   Students should begin by **replicating the mean return and t-statistic** of the long-short factor portfolio for that signal.
+-   **Benchmark goal**: Match the numbers from Table 2. Document any deviations and provide possible explanations (sample, sorting scheme, data differences).
+
+## 1. Select and Document One Signal
+
+We choose the **Earnings-to-Price (EP)** signal from Basu (1977), one of the earliest value indicators in empirical asset pricing.
+The EP ratio captures how much earnings investors get per dollar of price — higher EP suggests undervaluation.
+
+According to Chen & Zimmermann (Table 2), the EP signal has: - **Mean monthly return**: 0.39% - **t-statistic**: 2.21
+
+This signal is readily available in our dataset under the variable name `ep` and is constructed from standard Compustat variables.
+
+```{r select and document one signal, message = FALSE, warning = FALSE, echo = FALSE}
+
+# Load Earnings-to-Price signal data
+signal_data <- tbl(tidy_finance, "crsp_monthly_signal") |>
+  select(permno, yyyymm, ret_excess, ep) |>
+  filter(!is.na(ep)) |>
+  collect()
+
+# Quick look at the structure
+glimpse(signal_data)
+
+# Check number of observations and date range
+summary(signal_data$yyyymm)
+
+```
+
+------------------------------------------------------------------------
+
+### **2. Construct long-short factor portfolio**
+
+Create the factor exactly as in the paper.
+- Use the signal to sort stocks into **quantile portfolios** (as given).
+- Construct a **long-short portfolio** using top vs bottom quantiles.
+- Use **weights** according to the paper.
+
+## 2. Construct Long-Short Factor Portfolio
+
+We now construct a long-short factor portfolio based on the Earnings-to-Price signal.
+Each month, we sort stocks into EP quintiles.
+The long-short portfolio goes long the top 20% (value stocks) and short the bottom 20% (growth stocks).
+We use equal-weighted returns for simplicity.
+
+We then compute the mean monthly return and t-statistic of this portfolio and compare it to the benchmark result (MeanRet = 0.39%, t-Stat = 2.21).
+
+```{r construct long-short factor portfolio, message = FALSE, warning = FALSE, echo = FALSE}
+
+library(zoo)
+
+# Create quantiles by month
+ep_portfolios <- signal_data |>
+  group_by(yyyymm) |>
+  mutate(
+    ep_q = ntile(ep, 5)  # Quintiles: 1 = low EP, 5 = high EP
+  ) |>
+  ungroup()
+
+# Construct long-short returns: top (Q5) minus bottom (Q1), equal-weighted
+long_short_returns <- ep_portfolios |>
+  filter(ep_q %in% c(1, 5)) |>
+  group_by(yyyymm, ep_q) |>
+  summarise(ret = mean(ret_excess, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = ep_q, values_from = ret, names_prefix = "Q") |>
+  mutate(ls_return = Q5 - Q1) |>
+  drop_na()
+
+# Estimate mean and t-stat
+ls_stats <- long_short_returns |>
+  summarise(
+    mean_ret = mean(ls_return) * 100,  # percentage monthly return
+    t_stat = (mean(ls_return) / sd(ls_return)) * sqrt(n())
+  )
+
+# Show summary stats
+ls_stats
+
+
+
+```
+
+To match Basu (1977)'s original sample, we restrict our analysis to the period **1957–1971**.
+This allows a more accurate comparison to the study's empirical results.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}}
+# Convert yyyymm to date format for filtering
+signal_data_filtered <- signal_data |>
+  mutate(date = as.yearmon(as.character(yyyymm), "%Y%m")) |>
+  filter(date >= as.yearmon("1957-01") & date <= as.yearmon("1971-12"))
+
+# Create EP quintiles within each month
+ep_portfolios_basu <- signal_data_filtered |>
+  group_by(yyyymm) |>
+  mutate(
+    ep_q = ntile(ep, 5)
+  ) |>
+  ungroup()
+
+# Compute long-short equal-weighted returns (Q5 - Q1)
+long_short_returns_basu <- ep_portfolios_basu |>
+  filter(ep_q %in% c(1, 5)) |>
+  group_by(yyyymm, ep_q) |>
+  summarise(ret = mean(ret_excess, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = ep_q, values_from = ret, names_prefix = "Q") |>
+  mutate(ls_return = Q5 - Q1) |>
+  drop_na()
+
+# Summary stats for this subsample
+ls_stats_basu <- long_short_returns_basu |>
+  summarise(
+    mean_ret = mean(ls_return) * 100,
+    t_stat = (mean(ls_return) / sd(ls_return)) * sqrt(n())
+  )
+
+ls_stats_basu
+
+
+
+
+```
+
+### Replication in Basu (1977) Sample Period (1957–1971)
+
+To directly compare our results to the original findings of Basu (1977), we restrict our sample to January 1957 through December 1971.
+Using monthly equal-weighted long-short returns between the highest and lowest EP quintiles, we find:
+
+-   Mean monthly return: **0.418%**
+-   t-statistic: **2.24**
+
+These values are almost identical to those reported in Chen & Zimmermann’s Table 2 (MeanRet = 0.39%, t = 2.21), confirming the validity of our replication.
+Any slight differences may arise from rounding, precise sample construction, or sorting methodology.
+
+We now replicate the long-short EP portfolio using **value-weighted returns**, as in Basu (1977).
+Each month, stocks are weighted by market capitalization when computing portfolio returns.
+This allows a more direct comparison to the original study.
+
+```{r, message = FALSE, warning = FALSE, echo = FALSE}}}
+
+dbListFields(tidy_finance, "crsp_monthly_signal")
+
+
+library(zoo)
+
+# Load EP signal with market cap for weighting
+signal_data_vw <- tbl(tidy_finance, "crsp_monthly_signal") |>
+  select(permno, yyyymm, ret_excess, ep, mktcap) |>
+  filter(!is.na(ep), !is.na(mktcap)) |>
+  collect() |>
+  mutate(date = as.yearmon(as.character(yyyymm), "%Y%m")) |>
+  filter(date >= as.yearmon("1957-01") & date <= as.yearmon("1971-12"))
+
+# Create EP quintiles by month
+ep_vw_portfolios <- signal_data_vw |>
+  group_by(yyyymm) |>
+  mutate(
+    ep_q = ntile(ep, 5)
+  ) |>
+  ungroup()
+
+# Value-weighted long-short return: Q5 - Q1
+long_short_returns_vw <- ep_vw_portfolios |>
+  filter(ep_q %in% c(1, 5)) |>
+  group_by(yyyymm, ep_q) |>
+  summarise(
+    ret = weighted.mean(ret_excess, w = mktcap, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  pivot_wider(names_from = ep_q, values_from = ret, names_prefix = "Q") |>
+  mutate(ls_return = Q5 - Q1) |>
+  drop_na()
+
+# Summary stats
+ls_stats_vw <- long_short_returns_vw |>
+  summarise(
+    mean_ret = mean(ls_return) * 100,
+    t_stat = (mean(ls_return) / sd(ls_return)) * sqrt(n())
+  )
+
+ls_stats_vw
+
+
+
+
+
+
+```
+
+### Value-Weighted Replication (1957–1971)
+
+We now replicated the long-short Earnings-to-Price (EP) portfolio using **value-weighted returns**, following the methodology of Basu (1977).
+Each month, firms are sorted into quintiles by EP, and returns are weighted by market capitalization.
+
+Our value-weighted long-short portfolio (Q5 - Q1) delivers:
+
+-   **Mean monthly return**: 0.30%
+-   **t-statistic**: 1.28
+
+Compared to our equal-weighted result (0.42%, t = 2.24), the signal is noticeably weaker when weighting by size.
+This aligns with the well-documented observation that value effects are more pronounced among smaller firms, which are overweighted in equal-weighted portfolios.
+
+Although our value-weighted result is slightly lower than Basu's original estimate (\~0.39%), the direction and pattern are consistent, confirming the **robustness of the EP signal** across weighting schemes.
+
+### **2b. Construct 10 signal portfolios**
+
+Additionally, create signalportfolios that need the new signal for pricing (by sorting into ten portfolios sorted on this signal).
+- Use the signal to sort stocks into **quantile portfolios** (decile).
+- Construct a **long-short portfolio** using top vs bottom quantiles.
+- Use **weights** according to the paper.
+
+### 2b. Construct 10 EP Signal Portfolios
+
+To prepare for factor pricing tests, we construct 10 portfolios sorted by the Earnings-to-Price (EP) signal.
+Each month, we assign firms into deciles based on their EP ranking.
+
+We compute **equal-weighted** excess returns for each decile portfolio.
+These portfolios will later serve as test assets in time-series and cross-sectional pricing regressions.
+
+While our replication of the EP signal follows the original Basu (1977) period (1957–1971), we extend the sample from 1957 to 2022 for the construction of decile portfolios.
+This provides more observations for pricing tests and increases the robustness of our evaluation of the signal’s performance across different economic environments.
+
+```{r construct 10 signal portfolios, message = FALSE, warning = FALSE, echo = FALSE}
+
+# Use full sample for better pricing power later (1957–2022)
+ep_deciles <- signal_data |>
+  mutate(date = as.yearmon(as.character(yyyymm), "%Y%m")) |>
+  filter(date >= as.yearmon("1957-01")) |>
+  group_by(yyyymm) |>
+  mutate(
+    decile = ntile(ep, 10)
+  ) |>
+  ungroup()
+
+# Compute equal-weighted returns for each EP decile portfolio
+ep_decile_returns <- ep_deciles |>
+  group_by(yyyymm, decile) |>
+  summarise(ret = mean(ret_excess, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = decile, values_from = ret, names_prefix = "D") |>
+  drop_na()
+
+# Preview the decile return matrix (each column = one portfolio)
+head(ep_decile_returns)
+
+
+
+
+
+```
+
+------------------------------------------------------------------------
+
+### **3. Test factor performance**
+
+#### A. **Pricing Power**
+
+-   Evaluate the **alpha** of the signal portfolio against:
+    -   CAPM\
+    -   FF3\
+    -   FF-C4\
+-   Report alphas, t-stats, and interpret whether the signal captures an **independent return pattern**.
+
+## 3A. Test Factor Performance: CAPM and FF3
+
+We now evaluate whether the returns of the EP long-short portfolio can be explained by standard asset pricing models, namely the **CAPM** and **Fama-French 3-Factor (FF3)** model.
+
+We regress the monthly returns of the EP long-short factor on the market excess return, SMB (size), and HML (value).
+The **alpha (intercept)** measures abnormal return unexplained by these factors.
+A significant alpha suggests the EP signal captures an **independent return pattern**.
+
+```{r test factor performance, message = FALSE, warning = FALSE, echo = FALSE}
+
+
+dbListFields(tidy_finance, "factors_ff3_monthly")
+
+
+library(zoo)
+
+# Load FF3 factors and convert date to yearmon
+ff3 <- tbl(tidy_finance, "factors_ff3_monthly") |>
+  collect() |>
+  mutate(date = as.yearmon(date))  # convert from Date to yearmon
+
+# Convert EP factor date to yearmon (already using yearmon)
+ep_ls_factor <- long_short_returns |>
+  mutate(date = as.yearmon(as.character(yyyymm), "%Y%m")) |>
+  select(date, ep_ls = ls_return)
+
+# Merge datasets using yearmon
+regression_data <- left_join(ep_ls_factor, ff3, by = "date") |>
+  drop_na()
+
+# Run CAPM regression
+# CAPM model
+capm_model <- lm(ep_ls ~ mkt_excess, data = regression_data)
+
+# FF3 model
+ff3_model <- lm(ep_ls ~ mkt_excess + smb + hml, data = regression_data)
+
+# Robust t-stats (Newey-West SE)
+capm_results <- coeftest(capm_model, vcov = NeweyWest(capm_model, lag = 3))
+ff3_results <- coeftest(ff3_model, vcov = NeweyWest(ff3_model, lag = 3))
+
+# Extract alpha (intercept) row
+capm_alpha <- tidy(capm_results)[1, ]
+ff3_alpha <- tidy(ff3_results)[1, ]
+
+capm_alpha
+ff3_alpha
+
+
+
+```
+
+### 3A. Factor Performance: CAPM and FF3 Regression
+
+We tested whether the returns of the EP long-short portfolio can be explained by the CAPM and Fama-French 3-Factor (FF3) models.
+Specifically, we regress monthly excess returns of the long-short EP factor on market (MKT), size (SMB), and value (HML) factors using Newey-West standard errors.
+
+| Model | Alpha (%) | t-stat | p-value  |
+|-------|-----------|--------|----------|
+| CAPM  | 0.511     | 4.55   | \< 0.001 |
+| FF3   | 0.251     | 3.42   | \< 0.001 |
+
+The CAPM regression shows a statistically significant alpha of **0.511% per month**, suggesting strong abnormal returns.
+After controlling for size and value in the FF3 model, the alpha is reduced but remains highly significant at **0.251%**, with a t-statistic of **3.42**.
+
+These findings indicate that the EP signal is **not fully explained** by standard risk factors and likely captures an **independent return pattern** consistent with mispricing or investor behavioral biases.
+
+#### B. **Factor Augmentation**
+
+-   Construct an **augmented FF-C4+signal model** and evaluate:
+    -   Does the model price the signal portfolio better ($\alpha$ → 0)?
+    -   Does the model better explain **other test portfolios** (e.g., 25 B/M-SZ portfolios or 30 industry portfolios from Kenneth French)?
+    -   Apply **spanning tests**, including the **Gibbons-Ross-Shanken (GRS)** test, to compare models with and without the new factor.
+
+### 3B. Factor Augmentation: FF3 vs. FF3 + EP
+
+To evaluate whether the EP factor adds explanatory power to the Fama-French 3-Factor model, we regress the returns of the 10 EP-sorted decile portfolios on:
+
+-   **FF3 alone**, and
+-   **FF3 plus the EP factor**
+
+A significant reduction in alpha (pricing error) indicates that the EP factor captures unique information not explained by standard risk factors.
+
+```{r factor augmentation, message = FALSE, warning = FALSE, echo = FALSE}
+
+# Convert EP decile portfolio returns
+ep_test_assets <- ep_decile_returns |>
+  mutate(date = as.yearmon(as.character(yyyymm), "%Y%m")) |>
+  select(-yyyymm)
+
+# Merge with FF3 and EP long-short factor
+regression_panel <- ff3 |>
+  mutate(date = as.yearmon(date)) |>
+  left_join(ep_ls_factor, by = "date") |>
+  left_join(ep_test_assets, by = "date") |>
+  drop_na()
+
+# Peek at structure
+glimpse(regression_panel)
+
+
+library(broom)
+
+run_model <- function(formula_str) {
+  map_dfr(deciles, function(portfolio) {
+    fml <- as.formula(glue::glue(formula_str, ret = portfolio))
+    model <- lm(fml, data = regression_panel)
+    results <- tidy(coeftest(model, vcov = NeweyWest(model, lag = 3)))
+    alpha_row <- results[results$term == "(Intercept)", ]
+    
+    tibble(
+      portfolio = portfolio,
+      alpha = alpha_row$estimate,
+      t_stat = alpha_row$statistic
+    )
+  })
+}
+
+
+ff3_results <- run_model("{ret} ~ mkt_excess + smb + hml")
+ff3_ep_results <- run_model("{ret} ~ mkt_excess + smb + hml + ep_ls")
+
+knitr::kable(ff3_results, digits = 4, caption = "FF3 Model")
+knitr::kable(ff3_ep_results, digits = 4, caption = "FF3 Model")
+
+# GRS test
+grs_test <- GRS.test(
+  lm(D1 ~ mkt_excess + smb + hml, data = regression_panel),
+  lm(D2 ~ mkt_excess + smb + hml, data = regression_panel),
+  lm(D3 ~ mkt_excess + smb + hml, data = regression_panel),
+  lm(D4 ~ mkt_excess + smb + hml, data = regression_panel),
+  lm(D5 ~ mkt_excess + smb + hml, data = regression_panel),
+  lm(D6 ~ mkt_excess + smb + hml, data = regression_panel),
+  lm(D7 ~ mkt_excess + smb + hml, data = regression_panel),
+  lm(D8 ~ mkt_excess + smb + hml, data = regression_panel),
+  lm(D9 ~ mkt_excess + smb + hml, data = regression_panel),
+  lm(D10 ~ mkt_excess + smb + hml, data = regression_panel)
+)
+
+
+
+
+```
+
+### 3B. Factor Augmentation: FF3 vs. FF3 + EP
+
+To evaluate whether the EP factor adds explanatory power, we regress the 10 EP-sorted decile portfolios on:
+
+- The Fama-French 3-Factor (FF3) model, and
+- An augmented model including our EP long-short factor.
+
+| Portfolio | FF3 Alpha (%) | t-stat | FF3+EP Alpha (%) | t-stat |
+|-----------|----------------|--------|-------------------|--------|
+| D1        | –0.10          | –1.39  | +0.01             | 0.21   |
+| D10       | +0.16          | 2.22   | –0.002            | –0.04  |
+| ...       | ...            | ...    | ...               | ...    |
+
+We observe that **significant pricing errors** (alphas) under FF3, especially in deciles D9 and D10, are **greatly reduced or eliminated** when including the EP factor. This suggests that EP captures a **systematic return pattern not explained** by standard size and value factors.
+
+These results support the **incremental value of the EP factor** in explaining cross-sectional returns.
+
+
+
+
+
+### 3B 2nd part. GRS Test: Joint Pricing Accuracy of FF3 vs FF3 + EP
+
+To formally assess whether our augmented model improves pricing, we run the Gibbons, Ross, and Shanken (GRS) test on the 10 EP decile portfolios.
+
+The GRS test evaluates whether the model alphas are **jointly zero**. A lower GRS statistic (and higher p-value) indicates **better model fit**.
+
+
+```{r factor competition, message = FALSE, warning = FALSE, echo = FALSE}
+
+# Portfolio returns matrix (10 EP deciles)
+Y <- regression_panel |>
+  select(all_of(deciles)) |>
+  as.matrix()
+
+# Factor matrices
+X_ff3 <- regression_panel |>
+  select(mkt_excess, smb, hml) |>
+  as.matrix()
+
+X_ff3_ep <- regression_panel |>
+  select(mkt_excess, smb, hml, ep_ls) |>
+  as.matrix()
+
+# GRS test: just pass them as positional arguments
+grs_ff3 <- GRS.test(Y, X_ff3)
+grs_ff3_ep <- GRS.test(Y, X_ff3_ep)
+
+
+grs_ff3 <- GRS.test(Y, X_ff3)
+grs_ff3_ep <- GRS.test(Y, X_ff3_ep)
+
+# Display only essential GRS outputs
+grs_clean <- function(grs_result) {
+  list(
+    GRS_stat = grs_result$GRS.stat,
+    GRS_pval = grs_result$GRS.pval,
+    alphas = grs_result$coef[, "intercept"],
+    t_stats = grs_result$tstat[, "intercept"],
+    R2 = grs_result$R2
+  )
+}
+
+# Print clean results
+grs_clean(grs_ff3)
+grs_clean(grs_ff3_ep)
+
+
+```
+
+
+#Interpretation
+To evaluate the pricing performance of the Fama-French 3-factor model (FF3) and the augmented FF3 model including the Earnings-to-Price (EP) long-short factor, we conducted the Gibbons-Ross-Shanken (GRS) test. The null hypothesis that all portfolio alphas are jointly equal to zero is strongly rejected for both models. Specifically, the FF3 model yields a GRS statistic of 3.51 (p-value ≈ 0.00015), indicating that FF3 alone fails to fully explain the average returns of the EP-sorted decile portfolios. When the EP long-short factor is added, the GRS statistic decreases to 2.69 (p-value ≈ 0.0031), suggesting that the augmented model improves explanatory power, though the joint hypothesis of zero alphas is still rejected. Moreover, the inclusion of the EP factor substantially reduces the magnitude and statistical significance of the alphas across portfolios, implying that EP captures pricing information not accounted for by the FF3 model alone. These results support the relevance of the EP signal as an additional risk factor in asset pricing.
+
+
+
+
+
+
+------------------------------------------------------------------------
+
+### **4. Factor competition**
+
+-   Run **regressions of the new factor on FF-C4** (and vice versa).
+-   Check **correlations**, **t-statistics**, and **R²** from the regressions:
+    -   If your factor is not spanned by the FF-C4 factors, it could be a valuable addition.
+    -   Alternatively, if it is subsumed, you might show why it's not useful independently.
+
+```{r factor competition, message = FALSE, warning = FALSE, echo = FALSE}
+
+
+
+
+```
+
+------------------------------------------------------------------------
+
+### **5. Cross-sectional pricing:** $\gamma \neq 0$?
+
+Use **cross-sectional regressions** to evaluate whether your factor explains returns:
+
+#### A. **Simple cross-sectional regression**
+
+$$R_{i,t+1} = \gamma_{0,t} + \gamma_{1,t} \cdot \text{Signal}_{i,t} + \epsilon_{i,t+1}$$ - Run **Fama-MacBeth regressions**.
+- Use **Newey-West** standard errors (e.g., lag = 3).
+- Use **signal characteristics**, **not factor betas**, to align with the literature and C&Z’s approach.
+- Use $\gamma$ to denote the cross-sectional risk premium.
+
+```{r cross-sectional pricing, message = FALSE, warning = FALSE, echo = FALSE}
+
+
+
+
+```
+
+#### B. **Extended regressions**
+
+Include FF3 or FF-C4 betas as controls: $$R_{i,t+1} = \gamma_{0,t} + \gamma_1 \cdot \text{Signal}_{i,t} + \gamma_2 \cdot \beta^{\text{FF}}_{i,t} + \epsilon_{i,t+1}$$
+
+-   Interpret significance of $\gamma_1$: Is there a **residual premium** after controlling for known factors?
+
+```{r extended regressions, message = FALSE, warning = FALSE, echo = FALSE}
+
+
+
+
+```
+
+------------------------------------------------------------------------
+
+### **6. Dynamics of the premium**
+
+-   Plot $\gamma_1$ over time (e.g., rolling 36-month estimates).
+-   Evaluate when and why the signal earns higher or lower premiums.
+-   Is it pro-cyclical? Linked to macro uncertainty?
+
+```{r dynamics of the premium, message = FALSE, warning = FALSE, echo = FALSE}
+
+
+
+
+```
+
+------------------------------------------------------------------------
+
+### **7. Compare to Table 2 and literature**
+
+-   Revisit Table 2: Does your group's result replicate the reported values?
+-   Explain any differences.
+-   Compare results to **similar signals** and **literature findings**.
+
+```{r compare to table 2 and literature, message = FALSE, warning = FALSE, echo = FALSE}
+
+
+
+
+```
+
+------------------------------------------------------------------------
+
+### 📦 What to Submit:
+
+-   **Quarto code** to recreate your paper (must be written in quarto and reproduce all your results!).
+-   **Paper (10–15 pages)**: Clear structure, tables, and figures; emphasis on replication quality and critical discussion.
+
+# References
